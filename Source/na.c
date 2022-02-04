@@ -209,8 +209,8 @@ naselrelease(NAHSelectionRef nasel)
     CFRELEASE(nasel->clienttype);
     CFRELEASE(nasel->server);
     CFRELEASE(nasel->servertype);
-    if (nasel->ccache)
-	krb5_cc_close(nasel->na->context, nasel->ccache);
+    if (nasel->ccache && nasel->na)
+        krb5_cc_close(nasel->na->context, nasel->ccache);
     CFRELEASE(nasel->certificate);
     CFRELEASE(nasel->inferredLabel);
 }
@@ -400,6 +400,17 @@ nahrelease(NAHRef na)
 
     CFRELEASE(na->mechs);
 
+    // close any kerberos caches used by the selections before releasing them.  krb5_cc_close needs the context held by this class.
+    NAHSelectionRef nasel = NULL;
+    for (int n = 0; n < CFArrayGetCount(na->selections); n++) {
+        nasel = (NAHSelectionRef)CFArrayGetValueAtIndex(na->selections, n);
+        if (nasel->ccache) {
+            krb5_cc_close(na->context, nasel->ccache);
+            nasel->ccache = NULL;
+        }
+        nasel->na = NULL;
+    }
+
     CFRELEASE(na->selections);
 
     if (na->q)
@@ -560,7 +571,8 @@ addSelection(NAHRef na,
 	return NULL;
 
     nasel->client = CFRetain(client);
-    nasel->server = CFRetain(server);
+    nasel->server = server;
+    if (server) CFRetain(server);
     nasel->clienttype = clienttype;
     CFRetain(clienttype);
     nasel->servertype = servertype;
@@ -628,25 +640,11 @@ findUsername(CFAllocatorRef alloc, NAHRef na, CFDictionaryRef info)
 static bool
 have_lkdcish_hostname(NAHRef na, bool localIsLKDC)
 {
-    CFMutableStringRef btmmDomain = NULL;
-    CFStringRef btmmDomainData;
     bool ret = false;
-
-    btmmDomainData = _CSBackToMyMacCopyDomain();
-    if (btmmDomainData) {
-	btmmDomain = CFStringCreateMutableCopy(na->alloc, 0, btmmDomainData);
-	CFRELEASE(btmmDomainData);
-	if (btmmDomain) {
-	    CFStringTrim(btmmDomain, CFSTR("."));
-	    os_log(na_get_oslog(), "using BTMM domain %@", btmmDomain);
-	}
-    }
-    
 
     if (na->lchostname == NULL) {
 	na->lchostname = CFStringCreateMutableCopy(NULL, 0, na->hostname);
 	if (na->lchostname == NULL) {
-	    CFRELEASE(btmmDomain);
 	    return false;
 	}
     }
@@ -655,10 +653,6 @@ have_lkdcish_hostname(NAHRef na, bool localIsLKDC)
 
     if (localIsLKDC && CFStringHasSuffix(na->lchostname, CFSTR(".local")))
 	ret = true;
-    else if (btmmDomain && CFStringHasSuffix(na->lchostname, btmmDomain))
-	ret = true;
-
-    CFRELEASE(btmmDomain);
 
     return ret;
 }
@@ -853,10 +847,13 @@ use_existing_principals(NAHRef na, int only_lkdc, unsigned long flags)
 	    }
 
 	    if (cr == NULL || CFStringCompare(na->hostname, cr, 0) != kCFCompareEqualTo) {
-		krb5_free_principal(na->context, client);
-		krb5_cc_close(na->context, id);
-		continue;
+            krb5_free_principal(na->context, client);
+            krb5_cc_close(na->context, id);
+            CFRELEASE(cr);
+            CFRELEASE(u);
+            continue;
 	    }
+        CFRELEASE(cr);
 
 	    /* Create server principal */
 	    server = CFStringCreateWithFormat(na->alloc, NULL, CFSTR("%@/%s@%s"),
@@ -1233,7 +1230,7 @@ NAHCreate(CFAllocatorRef alloc,
 	  CFDictionaryRef info)
 {
     NAHRef na = NAAlloc(alloc);
-    CFStringRef canonname;
+    CFStringRef canonname = NULL;
     char *hostnamestr = NULL;
     
     dispatch_once(&init_globals, ^{
@@ -1249,13 +1246,15 @@ NAHCreate(CFAllocatorRef alloc,
     /* first undo the damage BrowserServices have done to the hostname */
 
     if (_CFNetServiceDeconstructServiceName(hostname, &hostnamestr)) {
-	canonname = CFStringCreateWithCString(na->alloc, hostnamestr, kCFStringEncodingUTF8);
-	free(hostnamestr);
-	if (canonname == NULL)
-	    return NULL;
+        canonname = CFStringCreateWithCString(na->alloc, hostnamestr, kCFStringEncodingUTF8);
+        free(hostnamestr);
+        if (canonname == NULL) {
+            CFRELEASE(na);
+            return NULL;
+        }
     } else {
-	canonname = hostname;
-	CFRetain(canonname);
+        canonname = hostname;
+        CFRetain(canonname);
     }
 
     na->hostname = CFStringCreateMutableCopy(alloc, 0, canonname);
@@ -1348,39 +1347,15 @@ NAHGetSelections(NAHRef na)
     return na->selections;
 }
 
-static CFStringRef
-copyInferedNameFromIdentity(SecIdentityRef identity)
-{
-    CFStringRef inferredLabel = NULL;
-    SecCertificateRef cert = NULL;
-
-    SecIdentityCopyCertificate(identity, &cert);
-    if (cert == NULL)
-	return NULL;
-    
-    inferredLabel = _CSCopyAppleIDAccountForAppleIDCertificate(cert, NULL);
-    if (inferredLabel == NULL)
-	SecCertificateInferLabel(cert, &inferredLabel);
-
-    CFRELEASE(cert);
-
-    return inferredLabel;
-}
-
-
 static void
 setFriendlyName(NAHRef na,
 		NAHSelectionRef selection,
-		SecIdentityRef cert,
 		krb5_ccache id,
 		int is_lkdc)
 {
     CFStringRef inferredLabel = NULL;
 
-    if (cert) {
-	inferredLabel = copyInferedNameFromIdentity(cert);
-
-    } else if (na->specificname || is_lkdc) {
+    if (na->specificname || is_lkdc) {
 	inferredLabel = na->username;
 	CFRetain(inferredLabel);
     } else {
@@ -1585,7 +1560,7 @@ acquire_kerberos(NAHRef na,
 	}
     }
 
-    setFriendlyName(na, selection, cert, id, is_lkdc);
+    setFriendlyName(na, selection, id, is_lkdc);
     {
 	krb5_data data;
 	data.data = "1";
@@ -1699,6 +1674,7 @@ NAHSelectionAcquireCredential(NAHSelectionRef selection,
 	if (selection->ccache) {
 	    os_log(na_get_oslog(), "have ccache");
 	    KRBCredChangeReferenceCount(selection->client, 1, 1);
+        CFRelease(selection->na);
 	    return true;
 	}
 
@@ -1852,9 +1828,6 @@ NAHSelectionAcquireCredential(NAHSelectionRef selection,
 	    CFRelease(selection->na);
 	    return false;
 	}
-
-	if (selection->certificate)
-	    selection->inferredLabel = copyInferedNameFromIdentity(selection->certificate);
 
 	if (selection->inferredLabel == NULL) {
 	    CFMutableStringRef str = CFStringCreateMutableCopy(NULL, 0, selection->client);
